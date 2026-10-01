@@ -123,8 +123,8 @@ Turn your Mac into an OpenAI-compatible speech transcription server for your loc
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/celiankk/whisperASR.git
-cd whisperASR
+git clone https://github.com/celiankk/SonicScribe.git
+cd SonicScribe
 
 # 2. Build release binary
 # Requires the Xcode toolchain (SwiftUI macros live there). If `xcode-select -p`
@@ -260,19 +260,15 @@ renaming the product only requires updating the build script's brand variables.
 
 ## 📄 License & Attribution
 
-**SonicScribe is a derivative work of [whisperASR](https://github.com/plateaukao/whisperASR) and is licensed under the Apache License 2.0** — the same license as the upstream project. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+**SonicScribe is an independent project, licensed under the Apache License 2.0.** See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+### Acknowledgements
+
+SonicScribe started from **[whisperASR](https://github.com/plateaukao/whisperASR)**, the macOS transcription app by Daniel Kao. Our sincere thanks to the author, and to everyone who contributed to it along the way — this project would not exist without their work.
+
+The upstream `LICENSE` is retained verbatim. In accordance with Apache-2.0 §4(b), [NOTICE](NOTICE) records that the files in this repository have been substantially modified since, and lists the modifications.
 
 Apache-2.0 is permissive, but it does **not** allow a derivative work to be relicensed on different terms. This project therefore stays Apache-2.0 and must not be described as MIT.
-
-### Upstream lineage
-
-| Repository | Role |
-|---|---|
-| [plateaukao/whisperASR](https://github.com/plateaukao/whisperASR) | Original project © Daniel Kao |
-| [shimianmaifu11-collab/whisperASR](https://github.com/shimianmaifu11-collab/whisperASR) | Fork |
-| [celiankk/whisperASR](https://github.com/celiankk/whisperASR) | Fork — this repository's `origin` |
-
-Upstream's `LICENSE` is retained verbatim. Per Apache-2.0 §4(b), [NOTICE](NOTICE) records that the files here have been substantially modified — the rename to SonicScribe, the multi-engine ASR layer, the translation pipeline, the floating subtitle overlay, the settings reorganisation, the meeting-minutes service and the benchmark tooling are all additions or rewrites on top of the upstream work.
 
 ### Third-party components
 

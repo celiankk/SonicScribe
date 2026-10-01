@@ -121,8 +121,8 @@ App 内置轻量级高性能 HTTP API 服务，可将你的 Mac 瞬间变为兼�
 
 ```bash
 # 1. 克隆项目仓库
-git clone https://github.com/celiankk/whisperASR.git
-cd whisperASR
+git clone https://github.com/celiankk/SonicScribe.git
+cd SonicScribe
 
 # 2. 编译可执行文件
 # 需要 Xcode 工具链（SwiftUI 宏只随 Xcode 提供）。若 `xcode-select -p` 指向
@@ -249,21 +249,17 @@ SonicScribe/
 
 ---
 
-## 📄 开源许可证与署名
+## 📄 开源许可证与致谢
 
-**声记 SonicScribe 是基于 [whisperASR](https://github.com/plateaukao/whisperASR) 的衍生作品，采用 Apache License 2.0 协议**——与上游项目一致。详见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。
+**声记 SonicScribe 是一个独立项目，采用 Apache License 2.0 协议。** 详见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。
+
+### 致谢
+
+SonicScribe 起步于 **[whisperASR](https://github.com/plateaukao/whisperASR)**——Daniel Kao 开发的 macOS 转录应用。谨向作者以及所有为之做出贡献的人致以诚挚谢意：没有他们的工作，就没有这个项目。
+
+上游 `LICENSE` 原样保留。依据 Apache-2.0 第 4(b) 条，[NOTICE](NOTICE) 记录了本仓库文件自那以来的实质性修改，并逐项列出。
 
 Apache-2.0 虽然是宽松协议，但**不允许**衍生作品改用其他协议发布。因此本项目保持 Apache-2.0，**不应被描述为 MIT**。
-
-### 上游血缘
-
-| 仓库 | 角色 |
-|---|---|
-| [plateaukao/whisperASR](https://github.com/plateaukao/whisperASR) | 原始项目 © Daniel Kao |
-| [shimianmaifu11-collab/whisperASR](https://github.com/shimianmaifu11-collab/whisperASR) | Fork |
-| [celiankk/whisperASR](https://github.com/celiankk/whisperASR) | Fork —— 本仓库的 `origin` |
-
-上游 `LICENSE` 原样保留。依据 Apache-2.0 第 4(b) 条，[NOTICE](NOTICE) 记录本仓库文件已对上游作品作出实质性修改——更名 SonicScribe、多引擎 ASR 层、翻译管线、悬浮字幕、设置重组、会议纪要服务与基准评测工具均为在上游基础上新增或重写。
 
 ### 第三方组件
 
