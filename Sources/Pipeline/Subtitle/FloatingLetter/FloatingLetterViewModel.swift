@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 import CoreGraphics
@@ -384,8 +385,9 @@ final class FloatingLetterViewModel {
         // 触发一次 renderText（把上一句画回已关闭的浮层）。
         pendingSentenceTask?.cancel()
         pendingSentenceTask = nil
-        pendingSentenceText = nil
-        deferredTranslation = nil
+        sentenceQueue.removeAll()
+        queuedSources.removeAll()
+        deferredTranslations.removeAll()
     }
 
     // MARK: - 闲置自动隐藏计时器
@@ -679,15 +681,27 @@ final class FloatingLetterViewModel {
         // 流式识别 → 标点/长度断句（停顿判定由 ASRManager VAD 负责）。
         switch detector.update(text: interimText) {
         case .recognized(let text):
-            stream.recognitionText = text
+            // R2 不回改：只用「连续两次假设的公共前缀」当候选（LocalAgreement-2），
+            // 尾部 holdback 先不进显示；再由显示门决定是否替换当前画面。
+            // 候选为空 = 还没有可信内容 → 保持原画面（绝不清屏）。
+            let candidate = stabilizer.candidate(for: text)
             stream.subtitleState = .recognizing
             // 逐字 partial 节流：最小 0.2s 间隔重绘（与逐字入场动画配合，
             // 小步快更比大步慢更更平滑）。
             let now = Date()
-            if now.timeIntervalSince(lastInterimRenderDate) >= 0.2 {
-                lastInterimRenderDate = now
-                renderText(text)
+            guard now.timeIntervalSince(lastInterimRenderDate) >= 0.2 else { break }
+            lastInterimRenderDate = now
+            switch displayGate.decide(current: displayedSourceText, candidate: candidate, now: now) {
+            case .keep:
+                // 画面没动 = 没有擦除（flicker_rate 的分子不增）。
+                readability.recordPartial(erased: false)
+            case .show(let shown):
+                let erased = !displayedSourceText.isEmpty
+                    && !shown.hasPrefix(displayedSourceText)
+                stream.recognitionText = shown
+                renderText(shown)
                 scheduleIdleClear()
+                readability.recordPartial(erased: erased)
             }
         case .sentenceEnded(let sentence):
             handleSentenceCompleted(sentence)
@@ -744,18 +758,14 @@ final class FloatingLetterViewModel {
         PipelineLatencyStore.shared.markRecognized()
 
         // 显示原文，进入 Translating（不阻塞下一句）；清空上一句的译文区。
-        // 最短停留：上一句显示不满 1.5s 时延迟顶替（防跳变闪读）。
+        // 最短停留：按**阅读速度**决定（见 SubtitleReadingSpeed），不再固定 1.5s；
+        // 新句进滚动队列，不再"后到顶替"（排队句被顶掉 = 那句话一次都不显示）。
         stream.recognitionText = trimmed
         stream.translationText = nil
         stream.showingTranslation = false
         stream.translationRenderer.clear()
         stream.subtitleState = .translating
-        // 记录排队中的句子：译文早于源文上屏时用它挂起译文（见
-        // flushDeferredTranslation）。直接渲染的分支会立即清掉。
-        pendingSentenceText = trimmed
-        // 上一句遗留的挂起译文作废（属于上一句，不该配到新句上）。
-        deferredTranslation = nil
-        renderSentenceWithMinDisplay(trimmed)
+        enqueueSentence(trimmed)
         // 记录本次翻译请求的句子：译文按此接收（Apple 引擎 partial 持续
         // 覆盖 recognitionText，不能用 recognitionText 校验译文归属）。
         streamingTranslationText = ""   // 新句子：重置流式译文累积
@@ -768,51 +778,89 @@ final class FloatingLetterViewModel {
     /// 流式译文增量（LLM streaming）：累积渲染逐字上屏。
     @ObservationIgnored private var streamingTranslationText = ""
     @ObservationIgnored private var lastStreamRenderDate = Date.distantPast
-    /// 句子最短停留：新句子替换显示后至少 1.5s 内不被下一句顶掉
-    ///（过快更新排队等待，防字幕跳变闪读）。打字增长不受限（同句追加）。
+    /// 当前屏「上次换句」的时刻：与阅读速度一起决定还能停留多久。
     @ObservationIgnored private var sentenceShownAt = Date.distantPast
     @ObservationIgnored private var pendingSentenceTask: Task<Void, Never>?
-    private static let minSentenceDisplay: TimeInterval = 1.5
 
-    /// 句子级渲染（最短停留调度）：不满 1.5s 的新句子排队，到点渲染；
-    /// 打字增长（同句追加）不受限。后到的句子顶掉排队中的前一句。
-    private func renderSentenceWithMinDisplay(_ text: String) {
-        pendingSentenceTask?.cancel()
+    // MARK: 显示策略状态（纯逻辑见 SubtitleDisplayPolicy.swift）
+
+    /// 待渲染句子队列（FIFO，积压时加速；不再"后到顶替"）。
+    @ObservationIgnored private var sentenceQueue = SubtitleSentenceQueue()
+    /// 已入队但还没上屏的句子（译文早到时据此挂起，避免"上一句原文 + 下一句译文"）。
+    @ObservationIgnored private var queuedSources: Set<String> = []
+    /// 早到、等源文上屏的译文（按源文归属，多句排队也不会串台）。
+    @ObservationIgnored private var deferredTranslations: [String: String] = [:]
+    /// LocalAgreement-2 稳定化：已提交前缀只增不减（R2 不回改）。
+    @ObservationIgnored private var stabilizer = LocalAgreementStabilizer()
+    /// 显示门：小改写不回退、持有超时后接受（防冻结）。
+    @ObservationIgnored private var displayGate = SubtitleDisplayGate()
+    /// **已上屏**的源文（renderer 里那份文本的"原文"）。
+    /// 不能用 stream.recognitionText 代替：句子入队时它就被设成待显示句了。
+    @ObservationIgnored private var displayedSourceText = ""
+    /// 可读性指标（flicker_rate / 合并 / 强制提交）。
+    @ObservationIgnored private(set) var readability = SubtitleReadabilityMetrics()
+
+    /// 句子入队并按需推进（滚动队列：保证每句至少完整出现一次）。
+    private func enqueueSentence(_ text: String) {
+        if let oldest = sentenceQueue.push(text) {
+            // 溢出：把最旧那句**合并**进队首，而不是丢弃（docs §5 P0-3）。
+            // 滚动窗口本来就只显示最近 N 行，合并后旧句的开头仍会短暂出现，
+            // 而不是"整句从未上屏"。
+            let next = sentenceQueue.pending.first ?? text
+            let merged = SubtitleSentenceQueue.merged(oldest, next)
+            sentenceQueue.replaceFirst(with: merged)
+            queuedSources.remove(oldest)
+            queuedSources.remove(next)
+            deferredTranslations[oldest] = nil
+            deferredTranslations[next] = nil
+            queuedSources.insert(merged)
+            readability.recordMergedSentence()
+            AppLogger.shared.log(.ui,
+                "[Renderer] sentence queue overflow, merged=\(oldest.prefix(16)) + \(next.prefix(16))")
+        }
+        queuedSources.insert(text)
+        advanceSentenceQueue()
+    }
+
+    /// 队列推进：当前屏按「它自己的阅读时长」停留，到点渲染下一句；
+    /// 已有定时器在等时不重复起（防抖）。
+    private func advanceSentenceQueue() {
+        guard pendingSentenceTask == nil, !sentenceQueue.isEmpty else { return }
         let now = Date()
+        let visibleChars = stream.renderer.lines.joined().count
+        let required = sentenceQueue.holdSeconds(chars: visibleChars)
         let elapsed = now.timeIntervalSince(sentenceShownAt)
-        guard elapsed < Self.minSentenceDisplay else {
-            sentenceShownAt = now
-            renderText(text)
-            flushDeferredTranslation()
+        guard elapsed < required else {
+            renderNextSentence()
+            advanceSentenceQueue()      // 仍有积压就继续（渲染内部会重排定时器）
             return
         }
-        let wait = Self.minSentenceDisplay - elapsed
+        let wait = required - elapsed
         pendingSentenceTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(wait))
             guard let self, !Task.isCancelled else { return }
-            self.sentenceShownAt = Date()
-            self.renderText(text)
-            self.flushDeferredTranslation()
+            self.pendingSentenceTask = nil
+            self.renderNextSentence()
+            self.advanceSentenceQueue()
         }
     }
 
-    /// 排队等待渲染的句子文本（源文尚未上屏时的归属标记）。
-    /// 译文早于源文到达时（译文 0.3s < 最短停留 1.5s），先挂起，
-    /// 等 renderText 真正把源文画上去再渲染——否则会出现
-    /// 「上一句的原文 + 下一句的译文」错配。
-    @ObservationIgnored private var pendingSentenceText: String?
-    /// 早到、等待源文上屏的译文。
-    @ObservationIgnored private var deferredTranslation: (source: String, text: String)?
+    /// 渲染队列里的下一句（并补渲染它早到的译文）。
+    private func renderNextSentence() {
+        guard let next = sentenceQueue.pop() else { return }
+        queuedSources.remove(next)
+        sentenceShownAt = Date()
+        renderText(next)
+        flushDeferredTranslation(for: next)
+    }
 
-    /// 源文实际上屏后调用：补渲染期间早到的译文。
-    private func flushDeferredTranslation() {
-        pendingSentenceText = nil
-        guard let deferred = deferredTranslation else { return }
-        deferredTranslation = nil
+    /// 源文实际上屏后调用：补渲染该句早到的译文（按源文归属，不串台）。
+    private func flushDeferredTranslation(for source: String) {
+        guard let deferred = deferredTranslations.removeValue(forKey: source) else { return }
         // 归属校验：译文对应的是当前正在显示的句子才渲染。
-        guard deferred.source == lastTranslationRequestSource,
+        guard source == lastTranslationRequestSource,
               !stream.renderer.text.isEmpty else { return }
-        applyTranslationText(deferred.text)
+        applyTranslationText(deferred)
     }
 
     /// 译文写入（原文保持不动，译文出现在下方译文区）。
@@ -865,12 +913,11 @@ final class FloatingLetterViewModel {
         guard !trimmedSource.isEmpty,
               trimmedSource == lastTranslationRequestSource else { return }
         let t = translation?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        // 源文还没上屏（该句仍在最短停留队列里）→ 不能立即渲染：否则会出现
-        // 「上一句的原文 + 这一句的译文」错配，持续到 1.5s 后源文才切换。
-        // 挂起，等 renderText 真正画上源文后由 flushDeferredTranslation 补渲。
-        // pendingSentenceText 仅在排队窗口内非 nil（立即渲染的分支会清空）。
-        if pendingSentenceText == trimmedSource {
-            deferredTranslation = (trimmedSource, t)
+        // 源文还没上屏（该句仍在滚动队列里）→ 不能立即渲染：否则会出现
+        // 「上一句的原文 + 这一句的译文」错配，持续到该句真正上屏。
+        // 按源文归属挂起，等 renderNextSentence 画上源文后补渲。
+        if queuedSources.contains(trimmedSource) {
+            deferredTranslations[trimmedSource] = t
             return
         }
         guard !stream.renderer.text.isEmpty else { return }
@@ -881,44 +928,35 @@ final class FloatingLetterViewModel {
     }
 
     /// 单一渲染入口：断句（中文 30 / 英文 80）→ 渲染器（≤ maxLines 行，不省略）。
-    /// 行数取设置页「字幕最大行数」（controls.maxLines）——此前原文/译文
-    /// 都硬编码 2，导致该设置只改变窗口尺寸签名、不影响实际显示行数。
-    /// 行数不变（同句增长/打字效果）时不加动画直接更新——每次 partial 都
-    /// 重新起 0.18s 动画会在快速流式输出时产生抖动；只在换行数（1→2 行）
-    /// 时用动画平滑过渡。
+    /// 行数取设置页「字幕最大行数」（controls.maxLines）。
+    ///
+    /// 只保留**最新** limit 行（SubtitleRollingWindow.tail）：直播字幕要让人看到
+    /// 正在说的话；旧实现用 prefix 保留最早几行，导致长句尾巴永远不上屏。
+    /// 不做行数变化动画——整块位移本身就是 R4 要消除的"跳重心"。
     private func renderText(_ text: String) {
         AppLogger.shared.log(.ui, "[Subtitle Display] render text=\(text.prefix(40))")
         let splitter = SubtitleSentenceSplitter()
         let limit = max(1, maxLines)
-        let lines = Array(splitter.split(text, language: SubtitleLanguage.detect(text)).prefix(limit))
+        let lines = splitter.split(text, language: SubtitleLanguage.detect(text))
         stream.renderer.maxLines = limit
-        if lines.count != stream.renderer.lines.count {
-            _ = withAnimation(.easeOut(duration: 0.18)) {
-                stream.renderer.setLines(lines)
-            }
-        } else {
-            _ = stream.renderer.setLines(lines)
-        }
+        _ = stream.renderer.setLines(SubtitleRollingWindow.tail(lines, limit: limit))
         stream.subtitleText = stream.renderer.text
+        displayedSourceText = text
         // 只喂浮层自身的 debug 统计（FloatingLetterIntegration 读 lastTotalMs）。
         // 延迟分区条的端到端在「译文上屏」处收口（applyTranslationText）——
         // 同一指标两个定义会互相污染 20 样本窗口均值。
         latencyManager.markDisplayed()
-        // 只打渲染结果：ViewModel 不反向依赖窗口控制器（调试窗口状态
-        // 由 OverlayController 自行打印）。
         AppLogger.shared.log(.ui, "[Subtitle Display] displayed=\(stream.renderer.text.prefix(40))")
     }
 
     /// 译文渲染入口：独立于原文渲染器（原文保持不动，译文出现在下方）。
-    /// 行数同样取设置页「字幕最大行数」（此前硬编码 2）。
+    /// 同样只保留最新 limit 行；动画交给视图层（这里重复起动画会让流式译文抖动）。
     private func renderTranslation(_ text: String) {
         let splitter = SubtitleSentenceSplitter()
         let lines = splitter.split(text, language: SubtitleLanguage.detect(text))
         let limit = max(1, maxLines)
         stream.translationRenderer.maxLines = limit
-        _ = withAnimation(.easeOut(duration: 0.18)) {
-            stream.translationRenderer.setLines(Array(lines.prefix(limit)))
-        }
+        _ = stream.translationRenderer.setLines(SubtitleRollingWindow.tail(lines, limit: limit))
     }
 
     /// 字幕空闲自动清除：subtitleClearDelay 秒没有新的 ASR 输入 → 清空浮窗，
@@ -963,8 +1001,11 @@ final class FloatingLetterViewModel {
         // 守卫不会再清掉它——停录/空闲清屏后字幕"诈尸"。
         pendingSentenceTask?.cancel()
         pendingSentenceTask = nil
-        pendingSentenceText = nil
-        deferredTranslation = nil
+        sentenceQueue.removeAll()
+        queuedSources.removeAll()
+        deferredTranslations.removeAll()
+        stabilizer.reset()
+        displayGate.reset()
         if clearMemory {
             detector.reset()
             sentenceDeduplicator.reset()
@@ -974,14 +1015,26 @@ final class FloatingLetterViewModel {
             sentenceTrigger.reset()
             lastTranslationRequestSource = ""
             lastProcessedInputSignature = nil
+            // 可读性指标随会话结束归档（flicker_rate 目标 < 0.05）。
+            AppLogger.shared.log(.ui, "[Renderer] readability \(readability.summary)")
+            readability.reset()
         }
         streamingTranslationText = ""
         lastStreamRenderDate = .distantPast
+        displayedSourceText = ""
         latencyManager.reset()
         // 淡出清除：字幕/译文平滑消失，不做瞬间闪断。
-        withAnimation(.easeOut(duration: 0.25)) {
+        // 系统开了「减少动态效果」时瞬时清除（HIG：尊重 Reduce Motion；
+        // 这里用 NSWorkspace 而非 MotionPrefs——本类不是 MainActor，
+        // 直接读 @MainActor 的 MotionPrefs 会有隔离问题）。
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             stream.renderer.clear()
             stream.translationRenderer.clear()
+        } else {
+            withAnimation(.easeOut(duration: 0.25)) {
+                stream.renderer.clear()
+                stream.translationRenderer.clear()
+            }
         }
         stream.recognitionText = ""
         stream.translationText = nil

@@ -479,9 +479,12 @@ struct SubtitleRenderer {
     private(set) var text = ""
 
     /// 设置展示行；与上次相同返回 false（调用方不刷新）。
+    ///
+    /// 只保留**最新** maxLines 行：直播字幕要让人看到正在说的话。
+    /// （旧实现取前缀，长句尾巴永远不上屏——见 docs/字幕刷新优化项.md §3.1。）
     @discardableResult
     mutating func setLines(_ newLines: [String]) -> Bool {
-        let capped = Array(newLines.prefix(max(maxLines, 1)))
+        let capped = SubtitleRollingWindow.tail(newLines, limit: max(maxLines, 1))
         guard capped != lines else { return false }
         lines = capped
         text = capped.joined(separator: "\n")
