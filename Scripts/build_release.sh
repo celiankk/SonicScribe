@@ -90,6 +90,55 @@ elif [ -z "${DEVELOPER_DIR:-}" ]; then
     fi
 fi
 
+# ---------------------------------------------------------------------------
+# SDK 与运行系统版本对齐（本机实测的启动崩溃根因）
+# ---------------------------------------------------------------------------
+# 现象：默认 SDK 比当前 macOS 新一个大版本时（本机：SDK MacOSX27.0 + 系统 26.6.2），
+# release 构建出的 app 启动即 abort：
+#   failed to demangle witness for associated type 'Body' in conformance
+#   'WhisperASR.WhisperASRApp: App' from mangled name '??' -
+#   subject type qd__ does not conform to protocol Commands
+# 即「用新 SDK 的 SwiftUI 接口编译、运行期链接的却是旧系统的 SwiftUI」，
+# App / Scene 的 protocol requirement 布局对不上，witness 查找拿到垃圾名字后
+# swift_getAssociatedTypeWitnessSlowImpl 直接 fatalError。
+# debug（-Onone）恰好不走这条查找路径，所以只有 release 包崩溃——
+# 即 1.0.0 的 SonicScribe.app / DMG 是启动即崩的。
+# 对策：SDK 主版本 > 运行系统主版本时，自动改用 SDKs 目录下「不高于系统版本」
+# 的最高 SDK；找不到合适 SDK 时保持默认并打印警告（不静默降级）。
+align_sdk_with_running_os() {
+    local os_major sdk_ver sdk_dir candidate cname cver best="" best_ver=""
+    os_major="$(sw_vers -productVersion | cut -d. -f1)"
+    sdk_ver="$(xcrun --show-sdk-version 2>/dev/null || true)"
+    [ -n "$sdk_ver" ] || return 0
+    # 只处理「SDK 比系统新」这一种情况；相等或更旧时不动。
+    [ "${sdk_ver%%.*}" -gt "$os_major" ] 2>/dev/null || return 0
+    sdk_dir="$(dirname "$(xcrun --show-sdk-path 2>/dev/null || true)")"
+    [ -d "$sdk_dir" ] || return 0
+    for candidate in "$sdk_dir"/MacOSX*.sdk; do
+        [ -d "$candidate" ] || continue
+        cname="$(basename "$candidate")"
+        cver="$(printf '%s' "$cname" | sed -E 's/^MacOSX([0-9]+(\.[0-9]+)?)\.sdk$/\1/')"
+        # 非版本式命名（如 MacOSX.sdk 本身）跳过
+        [ "$cver" = "$cname" ] && continue
+        [ "${cver%%.*}" -le "$os_major" ] || continue
+        if [ -z "$best" ] || [ "$(printf '%s\n%s\n' "$best_ver" "$cver" | sort -g | tail -1)" = "$cver" ]; then
+            best="$candidate"
+            best_ver="$cver"
+        fi
+    done
+    if [ -z "$best" ]; then
+        echo "==> [警告] 默认 SDK $sdk_ver 比运行系统 macOS $os_major 新，且未找到不高于系统的 SDK；" >&2
+        echo "    构建产物可能启动即崩（SwiftUI witness demangle 失败）。" >&2
+        return 0
+    fi
+    # 变量一律用 ${} 包裹：紧跟全角字符（（ ） 等）时 bash 3.2 在非 UTF-8
+    # locale 下会把多字节首字节当成标识符字符，报 "unbound variable"（同下方 xcframework 段的坑）。
+    echo "==> SDK 对齐：默认 $sdk_ver 比系统 macOS $os_major 新 → 改用 ${best_ver}（${best}）"
+    SWIFT_EXTRA_ARGS+=(--sdk "$best")
+}
+
+align_sdk_with_running_os
+
 # 品牌参数（可经环境变量注入；默认「声记 SonicScribe」，与仓库内
 # SonicScribe.app / CI 工作流 / 应用显示名保持一致）。
 # 改名时只需覆盖这些变量，Swift 侧不再硬编码品牌名——URL scheme 判定
@@ -223,7 +272,14 @@ EOF
     exit 1
 fi
 echo "==> Copying SwiftPM resource bundle ($RESOURCE_BUNDLE_NAME)..."
-cp -R "$RESOURCE_BUNDLE_SRC" "$APP_BUNDLE/$RESOURCE_BUNDLE_NAME"
+# 只放 Contents/Resources。SwiftPM 生成的 resource_bundle_accessor 按
+#   Bundle.main.resourceURL → Bundle(for:).resourceURL → Bundle.main.bundleURL
+# 顺序查找，.app 内第一项就是 Contents/Resources，命中最先，够用。
+# 曾经再往 .app 根目录放一份，但那会让 codesign 直接失败：
+#   "unsealed contents present in the bundle root"
+# （macOS app bundle 根目录只允许有 Contents/），签名只能退回 adhoc，
+# 而 adhoc 的 designated requirement 绑 cdhash → 每次重建 TCC 授权失效，
+# 屏幕录制 / 麦克风就要重新授权一次。
 cp -R "$RESOURCE_BUNDLE_SRC" "$APP_BUNDLE/Contents/Resources/$RESOURCE_BUNDLE_NAME"
 
 # Create Info.plist
@@ -275,7 +331,39 @@ PLIST
 # Create PkgInfo
 echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
 
-if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+# ---------------------------------------------------------------------------
+# 代码签名：默认自动挑一个「稳定身份」
+# ---------------------------------------------------------------------------
+# 为什么必须签：未签名 / adhoc 签名的 app，其 designated requirement 绑在
+# cdhash 上——每次重建 cdhash 都变，macOS 就把它当成另一个 app，屏幕录制 /
+# 麦克风 / 语音识别等 TCC 授权全部失效，用户每次都要重新授权。
+# 用真实证书签名后 DR 变成
+#   identifier "com.sonicscribe.app" and certificate leaf[subject.CN] = "<身份>"
+# 跨重建稳定 → 授权一次长期有效。
+#
+# 身份优先级：Developer ID Application（对外分发）> Apple Development（本机开发）。
+# 可用 CODESIGN_IDENTITY 显式覆盖；都没有时退回 adhoc 并明确警告后果。
+auto_detect_codesign_identity() {
+    local idents picked
+    idents="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+    picked="$(printf '%s\n' "$idents" | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"' || true)"
+    if [ -z "$picked" ]; then
+        picked="$(printf '%s\n' "$idents" | grep -o '"Apple Development: [^"]*"' | head -1 | tr -d '"' || true)"
+    fi
+    printf '%s' "$picked"
+    return 0
+}
+
+SIGN_IDENTITY="${CODESIGN_IDENTITY:-$(auto_detect_codesign_identity)}"
+
+if [ -n "$SIGN_IDENTITY" ]; then
+    # hardened runtime 只在对外分发（Developer ID + 公证）时才需要；
+    # 本地开发打开它只会多一层约束，故默认关，需要时 HARDENED_RUNTIME=1。
+    case "$SIGN_IDENTITY" in
+        "Developer ID Application"*) HARDENED_RUNTIME="${HARDENED_RUNTIME:-1}" ;;
+    esac
+    ENTITLEMENTS=""
+    if [ "${HARDENED_RUNTIME:-0}" = "1" ]; then
     # Create entitlements for hardened runtime
     ENTITLEMENTS=$(mktemp /tmp/entitlements.XXXXXX.plist)
     cat > "$ENTITLEMENTS" << 'ENTPLIST'
@@ -289,17 +377,29 @@ if [ -n "${CODESIGN_IDENTITY:-}" ]; then
 </plist>
 ENTPLIST
 
-    echo "==> Signing app bundle..."
-    codesign --deep --force --options runtime \
-        --entitlements "$ENTITLEMENTS" \
-        --sign "$CODESIGN_IDENTITY" \
-        "$APP_BUNDLE"
-    rm -f "$ENTITLEMENTS"
+    fi
+    # 分发（Developer ID + 公证）必须带安全时间戳；本地开发用 none，
+    # 避免每次签名都要联网取时间戳。
+    SIGN_ARGS=(--force --deep --sign "$SIGN_IDENTITY")
+    if [ -n "$ENTITLEMENTS" ]; then
+        SIGN_ARGS+=(--options runtime --entitlements "$ENTITLEMENTS" --timestamp)
+    else
+        SIGN_ARGS+=(--timestamp=none)
+    fi
+    echo "==> Signing app bundle with: $SIGN_IDENTITY"
+    codesign "${SIGN_ARGS[@]}" "$APP_BUNDLE"
+    if [ -n "$ENTITLEMENTS" ]; then rm -f "$ENTITLEMENTS"; fi
     echo "==> Verifying signature..."
     codesign --verify --deep --strict "$APP_BUNDLE"
-    spctl --assess --type execute "$APP_BUNDLE" && echo "    Gatekeeper: OK" || echo "    Gatekeeper: not yet notarized (run notarytool to fix)"
+    codesign -d -r- "$APP_BUNDLE" 2>&1 | tail -1
+    spctl --assess --type execute "$APP_BUNDLE" && echo "    Gatekeeper: OK" || echo "    Gatekeeper: 未公证（对外分发才需要 notarytool）"
 else
-    echo "==> Skipping code signing (set CODESIGN_IDENTITY to sign)"
+    echo "==> [警告] 未找到可用签名身份，退回 adhoc 签名。"
+    echo "    后果：designated requirement 绑 cdhash，每次重建后屏幕录制 / 麦克风等"
+    echo "    TCC 授权都会失效，需要重新授权一次。"
+    echo "    修复：钥匙串里装一张 Apple Development / Developer ID Application 证书，"
+    echo "    或用 CODESIGN_IDENTITY=\"<身份名>\" 指定。"
+    codesign --force --deep --timestamp=none --sign - "$APP_BUNDLE"
 fi
 
 echo "==> Done! App bundle created at:"
@@ -307,7 +407,7 @@ echo "    $APP_BUNDLE"
 echo ""
 echo "    To run:  open $APP_BUNDLE"
 echo "    To move: cp -r $APP_BUNDLE /Applications/"
-if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+if [ -n "$SIGN_IDENTITY" ]; then
     echo ""
-    echo "    Signed with: $CODESIGN_IDENTITY"
+    echo "    Signed with: $SIGN_IDENTITY"
 fi

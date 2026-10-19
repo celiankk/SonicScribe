@@ -71,10 +71,32 @@ fi
 
 echo "==> 工具链：$TOOLCHAIN_NOTE"
 
+# 给调试产物签名（与 Scripts/build_release.sh 同一身份）。
+# 不签的话产物是 adhoc/linker-signed，designated requirement 绑 cdhash——
+# 每次重建 cdhash 都变，macOS 当成另一个 app，屏幕录制 / 麦克风 / 语音识别
+# 每次都要重新授权。用真实证书签后 DR 跨重建稳定，授权一次长期有效。
+sign_built_binary() {
+    local bin id
+    bin="$(swift build --show-bin-path "${SWIFT_ARGS[@]}")/WhisperASR"
+    [ -f "$bin" ] || return 0
+    id="$(security find-identity -v -p codesigning 2>/dev/null | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"' || true)"
+    if [ -z "$id" ]; then
+        id="$(security find-identity -v -p codesigning 2>/dev/null | grep -o '"Apple Development: [^"]*"' | head -1 | tr -d '"' || true)"
+    fi
+    [ -n "$id" ] || { echo "==> [警告] 未找到签名身份，产物保持 adhoc（权限会每次重授）"; return 0; }
+    if codesign --force --timestamp=none --sign "$id" "$bin" >/dev/null 2>&1; then
+        echo "==> 已签名：$id"
+    else
+        echo "==> [警告] 签名失败，产物保持 adhoc（权限会每次重授）"
+    fi
+    return 0
+}
+
 ACTION="${1:-build}"
 case "$ACTION" in
     build)
         swift build "${SWIFT_ARGS[@]}"
+        sign_built_binary
         ;;
     test)
         # XCTest 随 Xcode 提供（CLT 无）。CLT 路径下需要三组额外参数，
@@ -112,7 +134,11 @@ case "$ACTION" in
         fi
         ;;
     run)
-        swift run "${SWIFT_ARGS[@]}"
+        # 先构建 → 签名 → 直接跑产物：不用 swift run，避免它在签名后又重链一次
+        # 把签名冲掉。
+        swift build "${SWIFT_ARGS[@]}"
+        sign_built_binary
+        exec "$(swift build --show-bin-path "${SWIFT_ARGS[@]}")/WhisperASR"
         ;;
     *)
         echo "用法：bash Scripts/dev_build.sh [build|test|run]" >&2
