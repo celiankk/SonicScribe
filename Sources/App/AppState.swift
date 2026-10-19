@@ -189,6 +189,9 @@ class AppState {
     init() {
         history.load()
         selectedItemID = items.first?.id
+        // 历史遗留的 maxLines=3 + 默认容器 200pt：固定行盒会裁掉译文末行，
+        // 启动时补齐一次（只抬不降）。
+        ensureSubtitleContainerFits()
         // 统一错误管理：非致命错误（模型/API/网络/ASR）→ 分类日志 + toast，不退出。
         ErrorManager.shared.toastHandler = { [weak self] message in
             self?.showToast(message)
@@ -529,11 +532,14 @@ class AppState {
     func setSubtitleOverlaySourceFontSize(_ value: Double) {
         subtitleOverlaySourceFontSize = value
         UserDefaults.standard.set(value, forKey: SubtitleOverlayKeys.sourceFontSize)
+        // 字号改变行高 → 固定行盒高度随之变化，容器可能装不下了。
+        ensureSubtitleContainerFits()
     }
 
     func setSubtitleOverlayTranslationFontSize(_ value: Double) {
         subtitleOverlayTranslationFontSize = value
         UserDefaults.standard.set(value, forKey: SubtitleOverlayKeys.translationFontSize)
+        ensureSubtitleContainerFits()
     }
 
     func setSubtitleOverlayBorderOpacity(_ value: Double) {
@@ -545,6 +551,42 @@ class AppState {
         let clamped = min(max(lines, 1), 3)
         maxSubtitleLines = clamped
         UserDefaults.standard.set(clamped, forKey: "subtitleMaxLines")
+        ensureSubtitleContainerFits()
+    }
+
+    /// 字幕容器所需最小高度（pt）。
+    ///
+    /// 视图几何：原文行盒在容器里**垂直居中**（层高 = 源盒 + 上下各 8pt 内边距），
+    /// 译文 overlay 挂在源盒底边之下。要让译文底边不越出容器：
+    ///     (C − S − 16)/2 + 8 + S + T ≤ C   ⟺   C ≥ S + 2T
+    /// 早期版本按 `S + T + 16` 算，把下限算小了（maxLines=3 时译文仍被裁 35pt）。
+    /// 行高用与视图层**同一套** AppKit 度量（`subtitleSegmentSize`），避免两处各写一套。
+    static func requiredSubtitleContainerHeight(maxLines: Int,
+                                                sourceFontSize: Double,
+                                                translationFontSize: Double,
+                                                lineSpacing: Double) -> Double {
+        let rows = Double(min(max(maxLines, 1), 3))
+        let spacing = max(0, lineSpacing)
+        func box(_ fontSize: Double) -> Double {
+            let row = Double(subtitleSegmentSize(segment: "字",
+                                                 fontSize: CGFloat(fontSize),
+                                                 fontWeight: .semibold).height)
+            return rows * row + max(0, rows - 1) * spacing
+        }
+        return (box(sourceFontSize) + 2 * box(translationFontSize)).rounded(.up)
+    }
+
+    /// 行数变化后保证容器装得下：只抬不降（不覆盖用户手动调小的偏好，
+    /// 除非确实装不下——那时"容器大一点"比裁掉译文更好）。
+    private func ensureSubtitleContainerFits() {
+        let needed = Self.requiredSubtitleContainerHeight(
+            maxLines: maxSubtitleLines,
+            sourceFontSize: subtitleOverlaySourceFontSize,
+            translationFontSize: subtitleOverlayTranslationFontSize,
+            lineSpacing: subtitleLineSpacing)
+        if subtitleContainerHeight < needed {
+            setSubtitleContainerHeight(needed)
+        }
     }
 
     func setSubtitleHorizontalAlignment(_ value: String) {
@@ -602,6 +644,8 @@ class AppState {
         let clamped = min(max(value, 0), 12)
         subtitleLineSpacing = clamped
         UserDefaults.standard.set(clamped, forKey: "subtitleLineSpacing")
+        // 行间距直接进固定行盒高度 → 同样要保证容器装得下。
+        ensureSubtitleContainerFits()
     }
 
     func setFloatingOverlayAutoHide(_ enabled: Bool) {

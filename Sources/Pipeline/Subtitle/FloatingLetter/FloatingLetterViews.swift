@@ -236,66 +236,126 @@ private struct EditBorderOverlay: View {
 
 /// SubtitleTextLayer：原文（上）+ 译文（下）同时显示；
 /// 字号/粗细/行间距/对齐只影响本层，不影响容器/窗口尺寸。
+///
+/// R4（不跳重心）实现要点：
+/// 1. **固定行盒**：原文/译文各自是一个高度恒定的行盒，
+///    高度 = maxLines × 行高 + (maxLines − 1) × 行间距；行高由字号推出
+///    （用与字符视图同一套 AppKit 度量 `subtitleSegmentSize`），与当前
+///    实际行数无关；
+/// 2. **盒内是固定行网格、内容贴盒底**：每行占一个固定高度的槽位，
+///    行盒高度恒定 ⇒ 盒底边（= 盒顶 + 恒定高度）不随行数变化；
+///    内容自盒底向上排 ⇒ 底边锚定：1 行时贴着盒底（与译文之间无空隙）、
+///    2 行时向上长一格——新增行从下方出现、旧行上移一格，这正是
+///    CEA-608 roll-up / WebVTT scroll:up 的标准行为（眼睛盯的底边不动，
+///    末行基线 y 恒定）；
+/// 3. **译文不参与原文定位**：译文行盒挂在原文行盒的 overlay 上（偏移恒为
+///    盒高），不进入父级布局，因此译文出现/消失/行数变化都不会推动原文；
+/// 4. 去掉了原先 `Spacer` 上下夹 + `maxHeight: .infinity` 的"内容垂直居中"
+///    ——那种居中让内容重心随行数漂移（行数一变整块就上下移动），而逻辑层
+///    还给它加了 180ms 动画，把跳动放大成看得见的位移。
+///
+/// P2-2：本层所有动画都过 Reduce Motion 闸门（reduce 时瞬时）。
 private struct SubtitleTextLayerView: View {
     let viewModel: FloatingLetterViewModel
+
+    /// P2-2：系统「减少动态效果」（SwiftUI 系统环境值）。
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         let horizontal: HorizontalAlignment =
             viewModel.controls.subtitleTextAlignment == .leading ? .leading : .center
-        let lineAlignment = Alignment(
-            horizontal: viewModel.controls.subtitleTextAlignment == .leading ? .leading : .center,
-            vertical: .center)
-        return VStack(alignment: horizontal, spacing: viewModel.controls.subtitleLineSpacing) {
-            Spacer(minLength: 0)
-            // 原文区（始终显示）。末行是正在增长的活跃行：用逐字入场动画
-            // （公共前缀 diff——已显示的字保持静态，只有新增字淡入上移），
-            /// 流式追加呈现平滑打字感；非末行已定型，普通 Text 静态渲染。
-            let sourceLines = viewModel.stream.renderer.lines
-            ForEach(Array(sourceLines.enumerated()), id: \.offset) { index, line in
-                if index == sourceLines.count - 1 {
-                    SplitSubtitleText(
-                        text: line,
-                        fontSize: viewModel.controls.sourceFontSize,
-                        fontWeight: Self.fontWeight(viewModel.controls.subtitleFontWeight),
-                        foregroundStyle: .white,
-                        staggerDelay: 0.045,
-                        duration: 0.32,
-                        fromOffsetY: 12,
-                        fromScale: 0.95,
-                        alignment: lineAlignment
-                    )
-                    .lineLimit(nil) // 逻辑层控制内容，禁止 "..." 截断
-                } else {
-                    Text(line)
-                        .font(.system(size: viewModel.controls.sourceFontSize,
-                                      weight: Self.fontWeight(viewModel.controls.subtitleFontWeight)))
-                        .foregroundStyle(.white)
-                        .multilineTextAlignment(viewModel.controls.subtitleTextAlignment)
-                        .lineLimit(nil)
+        let lineAlignment = Alignment(horizontal: horizontal, vertical: .center)
+        // H 闸门：系统环境值 + 仓库既有运行时镜像（MotionPrefs）双保险。
+        let reduced = reduceMotion || MotionPrefs.shared.reduceMotion
+
+        // R4：行盒几何——行高只由字号/粗细决定（恒定），盒高只由 maxLines 决定。
+        let maxLines = max(1, viewModel.maxLines)
+        let spacing = max(0, viewModel.controls.subtitleLineSpacing)
+        let weight = Self.fontWeight(viewModel.controls.subtitleFontWeight)
+        let sourceRowHeight = Self.rowHeight(fontSize: viewModel.controls.sourceFontSize, weight: weight)
+        let translationRowHeight = Self.rowHeight(fontSize: viewModel.controls.translationFontSize, weight: weight)
+        let sourceBoxHeight = Self.boxHeight(rows: maxLines, rowHeight: sourceRowHeight, spacing: spacing)
+        let translationBoxHeight = Self.boxHeight(rows: maxLines, rowHeight: translationRowHeight, spacing: spacing)
+
+        let sourceLines = viewModel.stream.renderer.lines
+        let translationLines = viewModel.stream.translationRenderer.lines
+        let showsTranslation = viewModel.stream.showingTranslation && !translationLines.isEmpty
+
+        return VStack(alignment: horizontal, spacing: 0) {
+            // 原文行盒（始终显示）。末行是正在增长的活跃行：用逐字入场动画
+            // （公共前缀 diff——已显示的字保持静态，只有新增字纯淡入），
+            // 流式追加呈现平滑打字感；非末行已定型，普通 Text 静态渲染。
+            VStack(alignment: horizontal, spacing: spacing) {
+                ForEach(Array(sourceLines.enumerated()), id: \.offset) { index, line in
+                    if index == sourceLines.count - 1 {
+                        SplitSubtitleText(
+                            text: line,
+                            fontSize: viewModel.controls.sourceFontSize,
+                            fontWeight: weight,
+                            foregroundStyle: .white,
+                            // R5：动画预算封顶——无错峰、单字 ≤120ms、
+                            // 无位移、无缩放（总时长 ≤250ms）。
+                            staggerDelay: 0,
+                            duration: 0.12,
+                            alignment: lineAlignment
+                        )
+                        .lineLimit(nil) // 逻辑层控制内容，禁止 "..." 截断
                         .frame(maxWidth: .infinity, alignment: lineAlignment)
+                        .frame(height: sourceRowHeight)
+                    } else {
+                        Text(line)
+                            .font(.system(size: viewModel.controls.sourceFontSize, weight: weight))
+                            .foregroundStyle(.white)
+                            .multilineTextAlignment(viewModel.controls.subtitleTextAlignment)
+                            .lineLimit(nil)
+                            .frame(maxWidth: .infinity, alignment: lineAlignment)
+                            .frame(height: sourceRowHeight)
+                    }
                 }
             }
-            // 译文区（有译文时显示在原文下方，译文字号独立设置；
-            // 变化带淡入过渡）。
-            if viewModel.stream.showingTranslation, !viewModel.stream.translationRenderer.lines.isEmpty {
-                ForEach(Array(viewModel.stream.translationRenderer.lines.enumerated()), id: \.offset) { _, line in
-                    Text(line)
-                        .font(.system(size: viewModel.controls.translationFontSize,
-                                      weight: Self.fontWeight(viewModel.controls.subtitleFontWeight)))
-                        .foregroundStyle(.white.opacity(0.85))
-                        .multilineTextAlignment(viewModel.controls.subtitleTextAlignment)
-                        .lineLimit(nil)
-                        .frame(maxWidth: .infinity, alignment: lineAlignment)
-                        .animation(.easeOut(duration: 0.2), value: line)
+            // 固定行盒：高度与行数无关；内容贴盒底（底边锚定）——
+            // 1 行时贴底（与译文之间不留空隙）、2 行时向上长，盒底边不动。
+            .frame(height: sourceBoxHeight, alignment: .bottom)
+            // 译文区（有译文时显示在原文下方，译文字号独立设置）。
+            // 挂在 overlay 上 → 译文不参与原文行盒的定位：译文行数变化、
+            // 出现/消失都不会推动原文（R4）。
+            .overlay(alignment: .top) {
+                if showsTranslation {
+                    VStack(alignment: horizontal, spacing: spacing) {
+                        ForEach(Array(translationLines.enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .font(.system(size: viewModel.controls.translationFontSize, weight: weight))
+                                .foregroundStyle(.white.opacity(0.85))
+                                .multilineTextAlignment(viewModel.controls.subtitleTextAlignment)
+                                .lineLimit(nil)
+                                .frame(maxWidth: .infinity, alignment: lineAlignment)
+                                .frame(height: translationRowHeight)
+                                .animation(reduced ? nil : .easeOut(duration: 0.12), value: line)
+                        }
+                    }
+                    .frame(height: translationBoxHeight, alignment: .top)
+                    .offset(y: sourceBoxHeight)
                 }
             }
-            Spacer(minLength: 0)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .animation(.easeOut(duration: 0.18), value: viewModel.stream.renderer.text)
-        .animation(.easeOut(duration: 0.18), value: viewModel.stream.translationRenderer.text)
+        // 只约束宽度：高度由固定行盒决定，不再用 maxHeight: .infinity
+        // 让内容在剩余空间里垂直居中（那正是重心漂移的来源）。
+        .frame(maxWidth: .infinity)
+        .animation(reduced ? nil : .easeOut(duration: 0.12), value: viewModel.stream.renderer.text)
+        .animation(reduced ? nil : .easeOut(duration: 0.12), value: viewModel.stream.translationRenderer.text)
+    }
+
+    /// 单行行高：与 SplitSubtitleText / StaticLetterView 使用同一套 AppKit
+    /// 度量，保证行盒槽高与字符视图高度一致（差 1pt 会在两行时累积偏移）。
+    static func rowHeight(fontSize: CGFloat, weight: Font.Weight) -> CGFloat {
+        subtitleSegmentSize(segment: "字", fontSize: fontSize, fontWeight: weight).height
+    }
+
+    /// 固定行盒高度：rows 个行槽 + (rows − 1) 个行间距。
+    static func boxHeight(rows: Int, rowHeight: CGFloat, spacing: CGFloat) -> CGFloat {
+        CGFloat(max(1, rows)) * rowHeight + CGFloat(max(0, rows - 1)) * spacing
     }
 
     /// 字体粗细映射（regular / medium→semibold 保持当前风格 / bold）。
@@ -322,10 +382,10 @@ private struct SourceSubtitleFallbackView: View {
                 fontSize: viewModel.controls.sourceFontSize,
                 fontWeight: .semibold,
                 foregroundStyle: .white,
-                staggerDelay: 0.06,
-                duration: 0.5,
-                fromOffsetY: 28,
-                fromScale: 0.92
+                // R5：动画预算封顶（无错峰、单字 ≤120ms、无位移/缩放）；
+                // H：reduce motion 时组件内部整体瞬时。
+                staggerDelay: 0,
+                duration: 0.12
             )
             .frame(maxWidth: .infinity, alignment: .center)
         } else {
@@ -420,8 +480,9 @@ struct OverlayControlBar: View {
         .frame(maxWidth: .infinity, alignment: .trailing)
         .opacity(viewModel.controls.controlsVisible ? 1 : 0)
         .allowsHitTesting(viewModel.controls.controlsVisible)
-        .animation(.easeOut(duration: 0.2), value: viewModel.controls.controlsVisible)
-        .animation(.easeOut(duration: 0.2), value: viewModel.controls.controlsCollapsed)
+        // P2-2：同一浮层内的动画统一过 MotionPrefs 闸门（reduce 时瞬时）。
+        .animation(Motion.anim(.easeOut(duration: 0.2)), value: viewModel.controls.controlsVisible)
+        .animation(Motion.anim(.easeOut(duration: 0.2)), value: viewModel.controls.controlsCollapsed)
     }
 }
 
@@ -549,6 +610,8 @@ struct FloatingLetterToolbarView: View {
 struct FloatingLetterRecordBarView: View {
     let viewModel: FloatingLetterViewModel
     @State private var pulsing = false
+    /// P2-2：reduce motion 时不做呼吸闪烁（红点保持常亮）。
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         HStack(spacing: 10) {
@@ -574,16 +637,16 @@ struct FloatingLetterRecordBarView: View {
                 .fill(.white.opacity(0.12))
                 .frame(width: 1, height: 14)
 
-            // 录制指示器（红点，呼吸动画）
+            // 录制指示器（红点，呼吸动画）；P2-2：reduce motion 时保持常亮不闪。
             Circle()
                 .fill(Color.red)
                 .frame(width: 8, height: 8)
                 .opacity(pulsing ? 0.35 : 1)
                 .animation(
-                    .easeInOut(duration: 0.7).repeatForever(autoreverses: true),
+                    Motion.anim(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)),
                     value: pulsing
                 )
-                .onAppear { pulsing = true }
+                .onAppear { pulsing = !(reduceMotion || MotionPrefs.shared.reduceMotion) }
 
             // 监听软件名称
             Text(viewModel.controls.recordingAppName)
