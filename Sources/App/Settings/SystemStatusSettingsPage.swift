@@ -45,6 +45,16 @@ struct SystemStatusSettingsView: View {
 
     var body: some View {
         Form {
+            // 管线延迟条：识别 / 发送 / 翻译 / 字幕刷新四段并排，越界标红。
+            // 放在本页最上方——它是实时字幕链路的体检表，先看这一条再看下面明细。
+            Section(header: IconSectionHeader("管线延迟条", icon: "chart.bar.fill", color: .cyan)) {
+                LatencySegmentBar(style: .full)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
+                SettingsHint(text: "四段按各自耗时占比分宽，段色由亮到深即「识别 → 发送 → 翻译 → 字幕刷新」的先后；灰=无数据，蓝=正常，橙≥80% 阈值，红=越界。悬停任一段可看口径与阈值。",
+                             level: .idle)
+            }
+
             Section(header: IconSectionHeader("服务状态", icon: "stethoscope", color: .green)) {
                 StatusRow(title: "后端服务",
                           text: monitor.backendRunning ? "运行中" : "未启动",

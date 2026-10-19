@@ -740,6 +740,8 @@ final class FloatingLetterViewModel {
         // 去重：近期相同句子不重复翻译/显示（防 ASR 重复输出）。
         guard sentenceDeduplicator.decide(trimmed) != .suppress else { return }
         sentenceDeduplicator.record(trimmed)
+        // 延迟分区条 t0：该句识别结果就绪，开启本句 span（上一句残留作废）。
+        PipelineLatencyStore.shared.markRecognized()
 
         // 显示原文，进入 Translating（不阻塞下一句）；清空上一句的译文区。
         // 最短停留：上一句显示不满 1.5s 时延迟顶替（防跳变闪读）。
@@ -824,6 +826,9 @@ final class FloatingLetterViewModel {
             stream.translationText = trimmed
             renderTranslation(trimmed)
         }
+        // 延迟分区条 t3：译文渲染提交 → 刷新段 = 译文返回 → 译文上屏，
+        // 同时收口端到端（识别结果就绪 → 译文上屏 = 发送 + 翻译 + 刷新）。
+        PipelineLatencyStore.shared.markSubtitleRendered()
         stream.subtitleState = .showing
         scheduleIdleClear()
     }
@@ -870,8 +875,8 @@ final class FloatingLetterViewModel {
         }
         guard !stream.renderer.text.isEmpty else { return }
         latencyManager.markTranslated()
-        PipelineLatencyStore.shared.recordTranslate(
-            ms: Double(latencyManager.lastTranslationMs))
+        // 延迟分区条 t2：译文返回 → 翻译段 = 请求发出 → 译文返回（纯往返）。
+        PipelineLatencyStore.shared.markTranslationReceived()
         applyTranslationText(t)
     }
 
@@ -895,9 +900,10 @@ final class FloatingLetterViewModel {
             _ = stream.renderer.setLines(lines)
         }
         stream.subtitleText = stream.renderer.text
+        // 只喂浮层自身的 debug 统计（FloatingLetterIntegration 读 lastTotalMs）。
+        // 延迟分区条的端到端在「译文上屏」处收口（applyTranslationText）——
+        // 同一指标两个定义会互相污染 20 样本窗口均值。
         latencyManager.markDisplayed()
-        PipelineLatencyStore.shared.recordDisplay(
-            ms: Double(latencyManager.lastTotalMs))
         // 只打渲染结果：ViewModel 不反向依赖窗口控制器（调试窗口状态
         // 由 OverlayController 自行打印）。
         AppLogger.shared.log(.ui, "[Subtitle Display] displayed=\(stream.renderer.text.prefix(40))")

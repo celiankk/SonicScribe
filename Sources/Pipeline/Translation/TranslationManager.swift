@@ -157,6 +157,9 @@ final class TranslationManager {
             // 超时兜底（与 requestSentenceTranslation 同语义）：provider 挂起时
             // 不能让本句永久占用并发槽位。超时 = 服务慢 ≠ 服务不可用，
             // 故不计入三连失败降级（保持既有计数语义）。
+            // 延迟分区条 t1：请求真正发出（守卫/排队/提示词构建都已过完）
+            // → 发送段 = 识别结果就绪 → 请求发出。
+            PipelineLatencyStore.shared.markRequestSent()
             let result = try await Self.withTimeout(seconds: 10) {
                 try await provider.translateStreaming(
                     TranslationRequest(text: trimmed, targetLanguage: targetLang)) { delta in
